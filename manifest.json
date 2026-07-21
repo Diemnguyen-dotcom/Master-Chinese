@@ -1,0 +1,16 @@
+{
+  "name": "山水有相逢 · Sơn Thủy Hữu Tương Phùng",
+  "short_name": "山水有相逢",
+  "description": "Ứng dụng học từ vựng tiếng Trung mang đậm bản sắc sơn thủy cổ điển",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#f2ead9",
+  "theme_color": "#3e6b60",
+  "lang": "vi",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any maskable" }
+  ]
+}
