@@ -1,6 +1,9 @@
 /* Service Worker — 山水有相逢
-   Cache-first cho các tệp tĩnh, giúp app hoạt động offline sau lần tải đầu tiên. */
-const CACHE_NAME = 'sonthuy-v1';
+   Chiến lược NETWORK-FIRST: luôn ưu tiên lấy bản mới nhất từ mạng trước.
+   Chỉ dùng bản cache (đã lưu offline) khi KHÔNG có mạng — nhờ vậy mỗi lần
+   cập nhật index.html trên GitHub, người dùng sẽ luôn thấy bản mới ngay
+   lập tức khi có mạng, không bị kẹt ở bản cũ như chiến lược cache-first trước đây. */
+const CACHE_NAME = 'sonthuy-v2'; // Đổi version để buộc xóa sạch cache cũ (sonthuy-v1) đang kẹt bản index.html cũ
 const ASSETS = [
   './index.html',
   './manifest.json',
@@ -27,12 +30,10 @@ self.addEventListener('fetch', (event) => {
   if (event.request.url.includes('api.anthropic.com')) return;
 
   event.respondWith(
-    caches.match(event.request).then((cached) => {
-      return cached || fetch(event.request).then((resp) => {
-        const clone = resp.clone();
-        caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone)).catch(()=>{});
-        return resp;
-      }).catch(() => cached);
-    })
+    fetch(event.request).then((resp) => {
+      const clone = resp.clone();
+      caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone)).catch(()=>{});
+      return resp;
+    }).catch(() => caches.match(event.request)) // Mất mạng → mới dùng bản đã lưu offline
   );
 });
