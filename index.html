@@ -1208,6 +1208,9 @@ function openWordModal(word){
     const py = document.getElementById('f_py').value.trim();
     const vi = document.getElementById('f_vi').value.trim();
     if(!hz || !py || !vi){ showToast('Vui lòng điền đủ Chữ Hán, Pinyin và Nghĩa Việt.'); return; }
+    // Kiểm tra trùng lặp: nếu Chữ Hán này đã tồn tại ở 1 từ khác (không tính chính nó khi đang sửa) → chặn lưu, báo cho người dùng biết
+    const isDuplicate = State.words.some(w => w.hz === hz && w.id !== (word?.id || ''));
+    if(isDuplicate){ showToast('Từ này đã tồn tại.'); return; }
     const chosenCat = document.getElementById('f_cat').value;
     // Nếu thêm mới, hoặc đổi sang mục khác lúc sửa, tự gán STT tiếp theo của mục đó (không giới hạn số lượng)
     const stt = (!isEdit || word.cat!==chosenCat) ? nextSttFor(chosenCat) : word.stt;
