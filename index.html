@@ -369,7 +369,7 @@ function loadContent(){
 function saveContent(){
   LS.set('content', CONTENT);
   applyContentToCategories();
-  syncPushDebounced();
+  syncPushMetaDebounced();
 }
 function applyContentToCategories(){
   CATEGORIES.forEach(c=>{
@@ -473,9 +473,10 @@ function nextSttFor(catId){
 async function generateDemoWords(catId, count){
   let stt = nextSttFor(catId);
   const ts = Date.now();
+  const words = [];
   for(let i=1;i<=count;i++){
     const n = stt + i - 1;
-    const word = {
+    words.push({
       id: `demo_${catId}_${ts}_${i}`,
       cat: catId, stt: n,
       hz: `测${n}`, py: `cè ${n}`,
@@ -483,17 +484,17 @@ async function generateDemoWords(catId, count){
       exampleZh: `这是第${n}个测试词。`, examplePy: `zhè shì dì ${n} gè cè shì cí.`,
       exampleVi: `Đây là từ demo thứ ${n}.`,
       reviewCount:0, familiarity:0, favorite:false, isUser:true, isDemo:true, createdAt:Date.now(),
-    };
-    await dbPut(word);
-    State.words.push(word);
+    });
   }
-  syncPushDebounced();
+  await dbPutMany(words);
+  State.words.push(...words);
+  syncPushWordsBulk(words);
 }
 async function deleteAllDemoWords(){
   const demos = State.words.filter(w=>w.isDemo);
   for(const w of demos) await dbDelete(w.id);
   State.words = State.words.filter(w=>!w.isDemo);
-  syncPushDebounced();
+  syncDeleteWordsBulk(demos.map(w=>w.id));
 }
 /* Vá dữ liệu cũ: nếu người dùng đã có từ vựng lưu từ bản trước (chưa có trường stt),
    tự động gán STT tiếp theo cho những từ đó theo từng mục, không ảnh hưởng STT đã có. */
@@ -502,16 +503,18 @@ async function migrateMissingStt(){
   CATEGORIES.forEach(c=>{
     counters[c.id] = State.words.filter(w=>w.cat===c.id && w.stt>0).reduce((m,w)=>Math.max(m,w.stt),0);
   });
-  let changed = false;
+  const changedWords = [];
   for(const word of State.words){
     if(!word.stt || word.stt<=0){
       counters[word.cat] = (counters[word.cat]||0) + 1;
       word.stt = counters[word.cat];
-      await dbPut(word);
-      changed = true;
+      changedWords.push(word);
     }
   }
-  if(changed) syncPushDebounced();
+  if(changedWords.length){
+    await dbPutMany(changedWords);
+    syncPushWordsBulk(changedWords);
+  }
 }
 function sortByStt(list){
   return list.slice().sort((a,b)=>(a.stt||0)-(b.stt||0));
@@ -571,6 +574,19 @@ async function dbClearAll(){
     tx.onerror=e=>reject(e);
   });
 }
+/* Ghi nhiều từ trong CÙNG 1 transaction (nhanh hơn rất nhiều so với gọi dbPut() lặp lại từng từ một
+   — quan trọng khi dữ liệu lên tới hàng nghìn/hàng chục nghìn từ). */
+async function dbPutMany(words){
+  if(!words || !words.length) return;
+  const db = await getDB();
+  return new Promise((resolve,reject)=>{
+    const tx = db.transaction(STORE,'readwrite');
+    const store = tx.objectStore(STORE);
+    words.forEach(w=>store.put(w));
+    tx.oncomplete=()=>resolve();
+    tx.onerror=e=>reject(e);
+  });
+}
 async function seedIfEmpty(){
   const all = await dbGetAll();
   if(all.length===0){
@@ -614,13 +630,20 @@ function bumpStreak(){
 }
 
 /* ---------------------- 4b. ĐỒNG BỘ ĐA THIẾT BỊ (Firebase Firestore) ----------------------
-   App gốc chỉ lưu IndexedDB/localStorage — dữ liệu nằm trên từng máy, không tự đồng bộ.
-   Module này kết nối tới Firestore (đám mây, miễn phí) để mọi thiết bị dùng chung 1 "mã đồng bộ"
-   có thể đọc/ghi cùng một tài liệu dữ liệu (từ vựng + nội dung + tiến độ).
-   Người dùng cần tự tạo 1 project Firebase miễn phí và dán cấu hình vào trang Cài đặt. */
+   NÂNG CẤP: mỗi từ vựng giờ là 1 "document" riêng trong Firestore (subcollection "words"),
+   thay vì gộp cả mảng từ vào 1 document duy nhất như trước. Lý do bắt buộc phải đổi:
+   Firestore giới hạn CỨNG 1 document tối đa 1 MiB — với cấu trúc cũ, khi kho từ vượt khoảng
+   2.000-2.500 từ, việc đồng bộ sẽ lỗi. Với cấu trúc mới, mỗi từ chỉ là 1 document nhỏ (~0.5KB),
+   nên lưu được hàng chục nghìn từ không vấn đề gì.
+   AN TOÀN DỮ LIỆU: nếu phát hiện dữ liệu cũ (định dạng 1 document chứa cả mảng, từ bản trước
+   khi nâng cấp), hệ thống KHÔNG xoá field cũ đó — chỉ tự động đẩy dữ liệu đang có sẵn TRÊN CHÍNH
+   THIẾT BỊ NÀY (luôn là bản đầy đủ, đáng tin cậy nhất) sang định dạng mới. Dữ liệu cũ trên cloud
+   vẫn còn nguyên như 1 bản sao lưu, không bị đụng tới. */
 const Sync = {
-  app:null, db:null, unsub:null, code:null, config:null,
-  connected:false, lastSyncAt:null, lastWriteId:null, pushTimer:null,
+  app:null, db:null, code:null, config:null,
+  connected:false, lastSyncAt:null,
+  unsubMeta:null, unsubWords:null,
+  lastMetaWriteId:null, metaPushTimer:null,
 };
 function loadScriptOnce(src){
   return new Promise((resolve,reject)=>{
@@ -640,78 +663,171 @@ function genSyncCode(){
   let s=''; for(let i=0;i<8;i++) s+=chars[Math.floor(Math.random()*chars.length)];
   return s;
 }
-function syncDocRef(){
-  return Sync.db.collection('sonthuy_sync').doc(Sync.code);
+function metaDocRef(){ return Sync.db.collection('sonthuy_sync').doc(Sync.code); }
+function wordsColRef(){ return metaDocRef().collection('words'); }
+function chunkArray(arr, size){
+  const out=[]; for(let i=0;i<arr.length;i+=size) out.push(arr.slice(i,i+size)); return out;
 }
-/* Gom dữ liệu hiện tại của thiết bị thành 1 snapshot để đẩy lên đám mây */
-function buildLocalSnapshot(){
-  return {
-    words: State.words,
-    content: CONTENT,
-    stats: { streak: LS.get('streak',0), lastDate: LS.get('lastDate',null) },
-    writeId: Sync.lastWriteId = 'w'+Date.now()+'_'+Math.random().toString(36).slice(2,8),
-    updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
-  };
-}
-async function pushToCloud(){
-  if(!Sync.connected) return;
-  try{ await syncDocRef().set(buildLocalSnapshot(), {merge:false}); Sync.lastSyncAt = new Date(); }
-  catch(err){ showToast('Đồng bộ lỗi: '+err.message); }
-}
-function syncPushDebounced(){
-  if(!Sync.connected) return;
-  clearTimeout(Sync.pushTimer);
-  Sync.pushTimer = setTimeout(pushToCloud, 1000);
-}
-/* Áp dụng dữ liệu từ đám mây xuống thiết bị hiện tại (ghi đè local) */
-async function applyRemoteData(data){
-  if(Array.isArray(data.words)){
-    await dbClearAll();
-    for(const word of data.words) await dbPut(word);
-    State.words = data.words;
+/* Ghi hàng loạt từ vựng lên Firestore theo từng lô (Firestore giới hạn tối đa 500 thao tác/lần ghi) */
+async function batchWriteWords(words){
+  for(const chunk of chunkArray(words, 400)){
+    const batch = Sync.db.batch();
+    chunk.forEach(w => batch.set(wordsColRef().doc(w.id), w));
+    await batch.commit();
   }
+}
+async function batchDeleteWordIds(ids){
+  for(const chunk of chunkArray(ids, 400)){
+    const batch = Sync.db.batch();
+    chunk.forEach(id => batch.delete(wordsColRef().doc(id)));
+    await batch.commit();
+  }
+}
+async function pushAllWordsToCloud(){
+  if(!Sync.connected) return;
+  try{ await batchWriteWords(State.words); Sync.lastSyncAt = new Date(); }
+  catch(err){ showToast('Đồng bộ từ vựng lỗi: '+err.message); }
+}
+async function pushMetaToCloud(){
+  if(!Sync.connected) return;
+  try{
+    await metaDocRef().set({
+      content: CONTENT,
+      stats: { streak: LS.get('streak',0), lastDate: LS.get('lastDate',null) },
+      writeId: Sync.lastMetaWriteId = 'm'+Date.now()+'_'+Math.random().toString(36).slice(2,8),
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+    }, {merge:true}); // merge:true — KHÔNG xoá field "words" cũ (nếu có) từ định dạng trước khi nâng cấp
+    Sync.lastSyncAt = new Date();
+  }catch(err){ showToast('Đồng bộ lỗi: '+err.message); }
+}
+function syncPushMetaDebounced(){
+  if(!Sync.connected) return;
+  clearTimeout(Sync.metaPushTimer);
+  Sync.metaPushTimer = setTimeout(pushMetaToCloud, 1000);
+}
+async function syncPushWordCloud(word){
+  if(!Sync.connected) return;
+  try{ await wordsColRef().doc(word.id).set(word); Sync.lastSyncAt = new Date(); }
+  catch(err){ showToast('Đồng bộ từ lỗi: '+err.message); }
+}
+async function syncDeleteWordCloud(id){
+  if(!Sync.connected) return;
+  try{ await wordsColRef().doc(id).delete(); }
+  catch(err){ showToast('Đồng bộ xoá lỗi: '+err.message); }
+}
+async function syncPushWordsBulk(words){
+  if(!Sync.connected || !words || !words.length) return;
+  try{ await batchWriteWords(words); Sync.lastSyncAt = new Date(); }
+  catch(err){ showToast('Đồng bộ hàng loạt lỗi: '+err.message); }
+}
+async function syncDeleteWordsBulk(ids){
+  if(!Sync.connected || !ids || !ids.length) return;
+  try{ await batchDeleteWordIds(ids); }
+  catch(err){ showToast('Đồng bộ xoá hàng loạt lỗi: '+err.message); }
+}
+/* Áp dụng nội dung/tiến độ nhận từ đám mây — KHÔNG gọi saveContent() ở đây để tránh vòng lặp
+   đẩy ngược dữ liệu vừa nhận trở lại cloud (saveContent() vốn tự đẩy đồng bộ). */
+function applyRemoteMeta(data){
   if(data.content){
     CONTENT = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONTENT)), data.content);
     CONTENT.categories = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONTENT.categories)), data.content.categories||{});
-    saveContent();
+    LS.set('content', CONTENT);
+    applyContentToCategories();
     document.title = CONTENT.brandTitle + ' · ' + CONTENT.brandSub;
   }
   if(data.stats){
     if(data.stats.streak!=null) LS.set('streak', data.stats.streak);
     if(data.stats.lastDate!=null) LS.set('lastDate', data.stats.lastDate);
   }
-  render();
+}
+/* Ghi đè toàn bộ từ vựng local bằng danh sách lấy từ cloud (dùng khi người dùng chủ động chọn "Tải về") */
+async function applyRemoteWordsFull(wordsArray){
+  await dbClearAll();
+  if(wordsArray.length) await dbPutMany(wordsArray);
+  State.words = wordsArray;
+}
+/* Tự động phát hiện & nâng cấp dữ liệu cũ (định dạng 1 document chứa cả mảng) sang định dạng mới,
+   HOÀN TOÀN AN TOÀN: chỉ đọc để kiểm tra, không xoá gì, chỉ đẩy thêm dữ liệu local lên theo định dạng mới.
+   Trả về true nếu vừa thực hiện nâng cấp. */
+async function migrateIfOldFormat(){
+  const wordsSnap = await wordsColRef().get();
+  if(!wordsSnap.empty) return false; // đã ở định dạng mới rồi, không cần làm gì
+  const metaSnap = await metaDocRef().get();
+  const hasOldArray = metaSnap.exists && Array.isArray(metaSnap.data().words) && metaSnap.data().words.length>0;
+  if(hasOldArray && State.words.length>0){
+    showToast('Đang nâng cấp định dạng đồng bộ để hỗ trợ kho từ lớn hơn, vui lòng đợi...');
+    await pushAllWordsToCloud();
+    await pushMetaToCloud();
+    showToast('Đã nâng cấp xong — toàn bộ từ vựng đã an toàn ở định dạng mới.');
+    return true;
+  }
+  return false;
+}
+function attachRealtimeListeners(){
+  if(Sync.unsubMeta) Sync.unsubMeta();
+  if(Sync.unsubWords) Sync.unsubWords();
+
+  Sync.unsubMeta = metaDocRef().onSnapshot(doc=>{
+    if(!doc.exists) return;
+    const data = doc.data();
+    if(data.writeId === Sync.lastMetaWriteId) return; // bỏ qua tiếng vọng của chính mình
+    applyRemoteMeta(data);
+    render();
+  }, err=>{});
+
+  // Lắng nghe realtime theo TỪNG THAY ĐỔI (không tải lại toàn bộ mỗi lần) — an toàn & hiệu quả kể cả hàng chục nghìn từ
+  Sync.unsubWords = wordsColRef().onSnapshot(async snapshot=>{
+    const toUpsert = [], toDeleteIds = [];
+    snapshot.docChanges().forEach(change=>{
+      if(change.type==='removed') toDeleteIds.push(change.doc.id);
+      else toUpsert.push(change.doc.data());
+    });
+    if(!toUpsert.length && !toDeleteIds.length) return;
+    if(toUpsert.length) await dbPutMany(toUpsert);
+    for(const id of toDeleteIds) await dbDelete(id);
+    const map = new Map(State.words.map(w=>[w.id,w]));
+    toUpsert.forEach(w=>map.set(w.id,w));
+    toDeleteIds.forEach(id=>map.delete(id));
+    State.words = Array.from(map.values());
+    render();
+  }, err=>{});
 }
 async function connectSync(configObj, code){
   await ensureFirebaseSDK();
   if(!Sync.app){ Sync.app = firebase.initializeApp(configObj); }
   Sync.db = firebase.firestore();
   Sync.config = configObj; Sync.code = code;
-  const ref = syncDocRef();
-  const snap = await ref.get();
-  if(snap.exists){
-    const useRemote = confirm('Đã tìm thấy dữ liệu đồng bộ trên đám mây cho mã "'+code+'".\n\nOK = Tải dữ liệu đám mây về thiết bị này (ghi đè).\nHủy = Đẩy dữ liệu hiện tại của thiết bị này lên đám mây (ghi đè đám mây).');
-    if(useRemote){ await applyRemoteData(snap.data()); }
-    else { Sync.connected = true; await pushToCloud(); }
-  } else {
-    Sync.connected = true;
-    await pushToCloud();
-  }
   Sync.connected = true;
+
+  const migrated = await migrateIfOldFormat();
+
+  if(!migrated){
+    const wordsSnap = await wordsColRef().get();
+    if(!wordsSnap.empty){
+      const useRemote = confirm('Đã tìm thấy dữ liệu đồng bộ trên đám mây cho mã "'+code+'" ('+wordsSnap.size+' từ).\n\nOK = Tải dữ liệu đám mây về thiết bị này (ghi đè).\nHủy = Đẩy dữ liệu hiện tại của thiết bị này lên đám mây (ghi đè đám mây).');
+      if(useRemote){
+        const remoteWords = wordsSnap.docs.map(d=>d.data());
+        await applyRemoteWordsFull(remoteWords);
+        const metaSnap = await metaDocRef().get();
+        if(metaSnap.exists) applyRemoteMeta(metaSnap.data());
+      } else {
+        await pushAllWordsToCloud();
+        await pushMetaToCloud();
+      }
+    } else {
+      await pushAllWordsToCloud();
+      await pushMetaToCloud();
+    }
+  }
+
   LS.set('syncConfig', {config:configObj, code});
-  // Lắng nghe realtime: khi thiết bị khác cập nhật, tự động đồng bộ về
-  if(Sync.unsub) Sync.unsub();
-  Sync.unsub = ref.onSnapshot(doc=>{
-    if(!doc.exists) return;
-    const data = doc.data();
-    if(data.writeId === Sync.lastWriteId) return; // bỏ qua tiếng vọng của chính mình
-    applyRemoteData(data);
-    showToast('Đã nhận dữ liệu mới từ thiết bị khác.');
-  }, err=>{ /* im lặng nếu mất mạng tạm thời */ });
+  attachRealtimeListeners();
 }
 function disconnectSync(){
-  if(Sync.unsub) Sync.unsub();
-  Sync.unsub=null; Sync.connected=false; Sync.db=null; Sync.code=null;
+  if(Sync.unsubMeta) Sync.unsubMeta();
+  if(Sync.unsubWords) Sync.unsubWords();
+  Sync.unsubMeta=null; Sync.unsubWords=null;
+  Sync.connected=false; Sync.db=null; Sync.code=null;
   localStorage.removeItem('sonthuy_syncConfig');
 }
 async function autoConnectSyncOnBoot(){
@@ -722,13 +838,8 @@ async function autoConnectSyncOnBoot(){
     if(!Sync.app) Sync.app = firebase.initializeApp(saved.config);
     Sync.db = firebase.firestore(); Sync.config = saved.config; Sync.code = saved.code;
     Sync.connected = true;
-    const ref = syncDocRef();
-    Sync.unsub = ref.onSnapshot(doc=>{
-      if(!doc.exists) return;
-      const data = doc.data();
-      if(data.writeId === Sync.lastWriteId) return;
-      applyRemoteData(data);
-    }, err=>{});
+    await migrateIfOldFormat();
+    attachRealtimeListeners();
   }catch(err){ console.warn('Không thể tự kết nối đồng bộ:', err); }
 }
 
@@ -937,7 +1048,7 @@ function renderBrowse(list){
   body.querySelectorAll('[data-fav]').forEach(b=>b.onclick=async(e)=>{
     e.stopPropagation();
     const word = State.words.find(w=>w.id===b.dataset.fav);
-    word.favorite = !word.favorite; await dbPut(word); syncPushDebounced(); renderBrowse(list);
+    word.favorite = !word.favorite; await dbPut(word); syncPushWordCloud(word); renderBrowse(list);
   });
 
   const searchInput = document.getElementById('browseSearch');
@@ -1025,7 +1136,7 @@ function openWordDetailModal(word){
   document.getElementById('detailPlayEx').onclick = ()=> speak(word.exampleZh||word.hz);
   document.getElementById('detailAsk').onclick = ()=>{ modalRoot.innerHTML=''; askTutorAbout(word); };
   document.getElementById('detailFav').onclick = async ()=>{
-    word.favorite = !word.favorite; await dbPut(word); syncPushDebounced();
+    word.favorite = !word.favorite; await dbPut(word); syncPushWordCloud(word);
     modalRoot.innerHTML=''; openWordDetailModal(word);
   };
   document.getElementById('detailEdit').onclick = ()=>{
@@ -1097,7 +1208,7 @@ async function grade(word, easy, list){
   word.reviewCount += 1;
   word.familiarity = Math.max(0, Math.min(5, word.familiarity + (easy? 1 : -1)));
   await dbPut(word);
-  syncPushDebounced();
+  syncPushWordCloud(word);
   State.fcIndex = (State.fcIndex+1) % list.length;
   renderFlashcards(list);
 }
@@ -1161,13 +1272,13 @@ function renderWordList(){
   root.querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>speak(State.words.find(w=>w.id===b.dataset.play).hz));
   root.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>openWordModal(State.words.find(w=>w.id===b.dataset.edit)));
   root.querySelectorAll('[data-fav]').forEach(b=>b.onclick=async()=>{
-    const word = State.words.find(w=>w.id===b.dataset.fav); word.favorite=!word.favorite; await dbPut(word); syncPushDebounced(); renderWordList();
+    const word = State.words.find(w=>w.id===b.dataset.fav); word.favorite=!word.favorite; await dbPut(word); syncPushWordCloud(word); renderWordList();
   });
   root.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
     if(!confirm('Xóa từ vựng này?')) return;
     await dbDelete(b.dataset.del);
     State.words = State.words.filter(w=>w.id!==b.dataset.del);
-    syncPushDebounced();
+    syncDeleteWordCloud(b.dataset.del);
     renderWordList(); showToast('Đã xóa từ vựng.');
   });
 }
@@ -1233,7 +1344,7 @@ function openWordModal(word){
     await dbPut(data);
     const idx = State.words.findIndex(w=>w.id===data.id);
     if(idx>=0) State.words[idx]=data; else State.words.push(data);
-    syncPushDebounced();
+    syncPushWordCloud(data);
     modalRoot.innerHTML='';
     renderWordList();
     showToast(isEdit? 'Đã lưu thay đổi.' : 'Đã thêm từ vựng mới.');
@@ -1334,7 +1445,7 @@ async function answerQuiz(btn, q){
   }
   q.word.reviewCount++;
   await dbPut(q.word);
-  syncPushDebounced();
+  syncPushWordCloud(q.word);
   setTimeout(()=>{ State.quiz.i++; renderQuizQuestion(); }, 900);
 }
 function renderQuizResult(){
@@ -1364,7 +1475,7 @@ function renderQuizResult(){
   `;
   main.querySelectorAll('[data-play]').forEach(b=>b.onclick=()=>speak(b.dataset.play));
   main.querySelectorAll('[data-fav]').forEach(b=>b.onclick=async()=>{
-    const word = State.words.find(w=>w.id===b.dataset.fav); word.favorite=!word.favorite; await dbPut(word); syncPushDebounced();
+    const word = State.words.find(w=>w.id===b.dataset.fav); word.favorite=!word.favorite; await dbPut(word); syncPushWordCloud(word);
   });
 }
 
@@ -1480,6 +1591,23 @@ function renderSettings(){
     </div>
     <div class="fade-in" style="display:flex; flex-direction:column; gap:26px; max-width:760px;">
 
+      <div style="border:2px solid var(--vermilion); border-radius:8px; padding:16px 18px; background:var(--card-bg-solid);">
+        <h3 class="hanzi" style="margin-bottom:6px; color:var(--vermilion);">备份 · Sao lưu &amp; Khôi phục dữ liệu</h3>
+        <p class="meta" style="color:var(--fg-soft); line-height:1.6; margin-bottom:12px;">
+          Tải về 1 file chứa toàn bộ từ vựng + cài đặt hiện tại trên máy này. File này độc lập hoàn toàn với
+          app và đám mây — dù có chuyện gì xảy ra với IndexedDB hay Firebase, bạn vẫn luôn khôi phục lại được
+          từ chính file này. <b>Nên bấm "Tải file sao lưu" trước mỗi lần cập nhật lớn.</b>
+        </p>
+        <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+          <button class="btn small" id="exportBackupBtn" type="button">⬇ Tải file sao lưu (.json)</button>
+          <label class="btn small ghost" style="cursor:pointer;">
+            ⬆ Khôi phục từ file sao lưu
+            <input type="file" id="importBackupInput" accept=".json" style="display:none;">
+          </label>
+        </div>
+        <div class="meta" id="backupStatus" style="color:var(--fg-soft); margin-top:8px;"></div>
+      </div>
+
       <div>
         <h3 class="hanzi" style="margin-bottom:6px;">测试 · Công cụ kiểm thử</h3>
         <p class="meta" style="color:var(--fg-soft); line-height:1.6; margin-bottom:12px;">
@@ -1574,6 +1702,54 @@ function renderSettings(){
       </div>
     </div>
   `;
+
+  document.getElementById('exportBackupBtn').onclick = ()=>{
+    const backup = {
+      exportedAt: new Date().toISOString(),
+      appVersion: 'sonthuy-backup-v1',
+      words: State.words,
+      content: CONTENT,
+      stats: { streak: LS.get('streak',0), lastDate: LS.get('lastDate',null) },
+    };
+    const blob = new Blob([JSON.stringify(backup, null, 2)], {type:'application/json'});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const dateStr = new Date().toISOString().slice(0,10);
+    a.href = url; a.download = `sonthuy-backup-${dateStr}-${State.words.length}tu.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    document.getElementById('backupStatus').textContent = `Đã tải file sao lưu chứa ${State.words.length} từ vựng — lưu file này ở nơi an toàn (email, Google Drive...).`;
+    showToast('Đã tải file sao lưu.');
+  };
+  document.getElementById('importBackupInput').onchange = async (e)=>{
+    const file = e.target.files[0];
+    if(!file) return;
+    try{
+      const text = await file.text();
+      const backup = JSON.parse(text);
+      if(!Array.isArray(backup.words)) throw new Error('File không đúng định dạng sao lưu.');
+      if(!confirm(`File sao lưu có ${backup.words.length} từ (xuất lúc ${backup.exportedAt||'?'}).\n\nKhôi phục sẽ GHI ĐÈ toàn bộ ${State.words.length} từ đang có trên máy này bằng ${backup.words.length} từ trong file. Tiếp tục?`)) return;
+      await dbClearAll();
+      await dbPutMany(backup.words);
+      State.words = backup.words;
+      if(backup.content){
+        CONTENT = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONTENT)), backup.content);
+        CONTENT.categories = Object.assign(JSON.parse(JSON.stringify(DEFAULT_CONTENT.categories)), backup.content.categories||{});
+        saveContent();
+      }
+      if(backup.stats){
+        if(backup.stats.streak!=null) LS.set('streak', backup.stats.streak);
+        if(backup.stats.lastDate!=null) LS.set('lastDate', backup.stats.lastDate);
+      }
+      syncPushWordsBulk(State.words);
+      document.getElementById('backupStatus').textContent = `Đã khôi phục ${backup.words.length} từ từ file sao lưu.`;
+      showToast('Khôi phục thành công.');
+      render();
+    }catch(err){
+      showToast('Lỗi đọc file sao lưu: '+err.message);
+    }
+    e.target.value = '';
+  };
 
   document.getElementById('genDemoBtn').onclick = async ()=>{
     const catId = document.getElementById('demoCat').value;
